@@ -50,6 +50,8 @@
 #include <gst/video/video.h>
 #include <gst/video/gstvideofilter.h>
 
+#include <rockchip/rk_mpi.h>
+
 G_BEGIN_DECLS
 
 typedef enum {
@@ -80,6 +82,9 @@ typedef enum {
 typedef struct _GstIepDeinterlace      GstIepDeinterlace;
 typedef struct _GstIepDeinterlaceClass GstIepDeinterlaceClass;
 
+#define MPP_MAX_BUFFERS 1
+#define MPP_ALIGN(x, a)         (((x)+(a)-1)&~((a)-1))
+
 struct _GstIepDeinterlace
 {
   GstVideoFilter videofilter;
@@ -91,6 +96,13 @@ struct _GstIepDeinterlace
   GstIepDeinterlaceMethod method;
 
   GstIepDeinterlaceFieldLayout field_layout;
+
+  /* < private > */
+  /* Buffer */
+  MppBufferGroup input_group;
+  MppBufferGroup output_group;
+  MppBuffer input_buffer[MPP_MAX_BUFFERS];
+  MppBuffer output_buffer[MPP_MAX_BUFFERS];
 };
 
 struct _GstIepDeinterlaceClass 

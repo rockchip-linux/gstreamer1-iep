@@ -20,6 +20,11 @@ AM_MAINTAINER_MODE([enable])
 dnl check for tools (compiler etc.)
 AC_PROG_CC
 
+dnl determine c++ compiler
+AC_PROG_CXX
+dnl determine if c++ is available on this system
+AC_CHECK_PROG(HAVE_CXX, $CXX, yes, no)
+
 dnl required version of libtool
 LT_PREREQ([2.2.6])
 LT_INIT
@@ -28,6 +33,9 @@ dnl give error and exit if we don't have pkgconfig
 AC_CHECK_PROG(HAVE_PKGCONFIG, pkg-config, [ ], [
   AC_MSG_ERROR([You need to have pkg-config installed!])
 ])
+
+dnl check for the required mpp version
+PKG_CHECK_MODULES([ROCKCHIP_MPP], [rockchip_mpp >= 1.3.0])
 
 dnl Check for the required version of GStreamer core (and gst-plugins-base)
 dnl This will export GST_CFLAGS and GST_LIBS variables for use in Makefile.am

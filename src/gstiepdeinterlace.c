@@ -51,7 +51,10 @@
  * <refsect2>
  * <title>Example launch line</title>
  * |[
- * gst-launch -v -m fakesrc ! iepdeinterlace ! fakesink silent=TRUE
+ * gst-launch-1.0 v4l2src num-buffers=300 ! video/x-raw, format=NV12, width=704, height=480 ! iepdeinterlace ! filesink location=/tmp/yuv.raw
+ * ]|
+ * |[
+ * gst-launch-1.0 videotestsrc num-buffers=300 ! video/x-raw, format=NV12, width=704, height=480 ! iepdeinterlace ! filesink location=/tmp/yuv.raw
  * ]|
  * </refsect2>
  */
@@ -63,6 +66,7 @@
 #include <gst/gst.h>
 
 #include "gstiepdeinterlace.h"
+#include "iep_api.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_iep_deinterlace_debug);
 #define GST_CAT_DEFAULT gst_iep_deinterlace_debug
@@ -140,13 +144,21 @@ gst_iep_deinterlace_field_layout_get_type (void)
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, NV21, }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, NV21 }"))
+    /*GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ AYUV, "
+            "ARGB, BGRA, ABGR, RGBA, Y444, "
+            "xRGB, RGBx, xBGR, BGRx, RGB, BGR, Y42B, NV12, "
+            "NV21, YUY2, UYVY, YVYU, I420, YV12, IYUV, Y41B }"))*/
     );
 
 static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, NV21, }"))
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ NV12, NV21 }"))
+    /*GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("{ AYUV, "
+            "ARGB, BGRA, ABGR, RGBA, Y444, "
+            "xRGB, RGBx, xBGR, BGRx, RGB, BGR, Y42B, NV12, "
+            "NV21, YUY2, UYVY, YVYU, I420, YV12, IYUV, Y41B }"))*/
     );
 
 #define gst_iep_deinterlace_parent_class parent_class
@@ -160,6 +172,8 @@ static gboolean gst_iep_deinterlace_set_info (GstVideoFilter * vfilter, GstCaps 
     GstVideoInfo * in_info, GstCaps * outcaps, GstVideoInfo * out_info);
 static GstFlowReturn gst_iep_deinterlace_transform_frame (GstVideoFilter * vfilter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame);
+static gboolean gst_iep_deinterlace_start (GstBaseTransform * trans);
+static gboolean gst_iep_deinterlace_stop (GstBaseTransform * trans);
 /* GObject vmethod implementations */
 
 /* initialize the iepdeinterlace's class */
@@ -215,6 +229,8 @@ gst_iep_deinterlace_class_init (GstIepDeinterlaceClass * klass)
           DEFAULT_FIELD_LAYOUT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)
       );
 
+  trans_class->start = GST_DEBUG_FUNCPTR (gst_iep_deinterlace_start);
+  trans_class->stop = GST_DEBUG_FUNCPTR (gst_iep_deinterlace_stop);
   vfilter_class->set_info = GST_DEBUG_FUNCPTR (gst_iep_deinterlace_set_info);
   vfilter_class->transform_frame =
       GST_DEBUG_FUNCPTR (gst_iep_deinterlace_transform_frame);
@@ -224,11 +240,21 @@ gst_iep_deinterlace_class_init (GstIepDeinterlaceClass * klass)
  * initialize instance structure
  */
 static void
-gst_iep_deinterlace_init (GstIepDeinterlace * filter)
+gst_iep_deinterlace_init (GstIepDeinterlace * self)
 {
-  filter->silent = FALSE;
-  filter->method = DEFAULT_METHOD;
-  filter->field_layout = DEFAULT_FIELD_LAYOUT;
+  gint i;
+
+  self->silent = FALSE;
+  self->method = DEFAULT_METHOD;
+  self->field_layout = DEFAULT_FIELD_LAYOUT;
+
+  for (i = 0; i < MPP_MAX_BUFFERS; i++) {
+    self->input_buffer[i] = NULL;
+    self->output_buffer[i] = NULL;
+  }
+
+  self->input_group = NULL;
+  self->output_group = NULL;
 }
 
 static void
@@ -280,9 +306,9 @@ static gboolean
 gst_iep_deinterlace_set_info (GstVideoFilter * vfilter, GstCaps * incaps,
     GstVideoInfo * in_info, GstCaps * outcaps, GstVideoInfo * out_info)
 {
-  GstIepDeinterlace *iep = GST_IEPDEINTERLACE (vfilter);
+  GstIepDeinterlace *self = GST_IEPDEINTERLACE (vfilter);
 
-  GST_DEBUG_OBJECT (iep,
+  GST_DEBUG_OBJECT (self,
       "setting caps: in %" GST_PTR_FORMAT " out %" GST_PTR_FORMAT, incaps,
       outcaps);
 
@@ -299,21 +325,215 @@ gst_iep_deinterlace_set_info (GstVideoFilter * vfilter, GstCaps * incaps,
   /* ERRORS */
 invalid_caps:
   {
-    GST_ERROR_OBJECT (iep, "Invalid caps: %" GST_PTR_FORMAT, incaps);
+    GST_ERROR_OBJECT (self, "Invalid caps: %" GST_PTR_FORMAT, incaps);
     return FALSE;
   }
+}
+
+static void
+gst_iep_alloc_internal_buffer(GstIepDeinterlace *self)
+{
+  GstVideoInfo *info = &GST_VIDEO_FILTER (self)->in_info;
+
+  if (self->input_group == NULL) {
+    gint i = 0;
+    gint size = 0;
+
+    GST_DEBUG_OBJECT (self, "Filling src caps with output dimensions %ux%u,size %u",
+        info->width, info->height, info->size);
+
+    if (mpp_buffer_group_get_internal (&self->input_group, MPP_BUFFER_TYPE_ION))
+      goto activate_failed;
+    if (mpp_buffer_group_get_internal (&self->output_group,
+            MPP_BUFFER_TYPE_ION))
+      goto activate_failed;
+
+    for (i = 0; i < MPP_MAX_BUFFERS; i++) {
+      if (mpp_buffer_get (self->input_group, &self->input_buffer[i],
+              info->size))
+        goto activate_failed;
+      if (mpp_buffer_get (self->output_group, &self->output_buffer[i],
+              info->size))
+        goto activate_failed;
+    }
+  }
+  return;
+
+activate_failed:
+  GST_ERROR_OBJECT (self, "Alloc Buffer Failed");
+  return;
+}
+static void
+gst_iep_process (GstIepDeinterlace *self, GstVideoFrame * in_frame, GstVideoFrame * out_frame)
+{
+  gint in_width, in_height, in_stride, in_row_wrap;
+  gint out_width, out_height, out_stride, out_row_wrap;
+  GstVideoFormat in_fmt, out_fmt;
+  guint8 *in_data, *out_data;
+  struct iep_ops *iep_ops;
+  void *iep_obj;
+  iep_img src, dst;
+  iep_param_yuv_deinterlace_t yuv_dil;
+  MppBuffer frame_in;
+  MppBuffer frame_out;
+  unsigned long src_phy_addr;
+  unsigned long src_vir_addr;
+  unsigned long dst_phy_addr;
+  unsigned long dst_vir_addr;
+  int ret;
+
+  in_fmt = GST_VIDEO_FRAME_FORMAT (in_frame);
+  in_data = GST_VIDEO_FRAME_COMP_DATA (in_frame, 0);
+  in_stride = GST_VIDEO_FRAME_COMP_STRIDE (in_frame, 0);
+  in_width = GST_VIDEO_FRAME_COMP_WIDTH (in_frame, 0);
+  in_height = GST_VIDEO_FRAME_COMP_HEIGHT (in_frame, 0);
+  in_row_wrap = in_stride - in_width;
+
+  out_fmt = GST_VIDEO_FRAME_FORMAT (out_frame);
+  out_data = GST_VIDEO_FRAME_COMP_DATA (out_frame, 0);
+  out_stride = GST_VIDEO_FRAME_COMP_STRIDE (out_frame, 0);
+  out_width = GST_VIDEO_FRAME_COMP_WIDTH (out_frame, 0);
+  out_height = GST_VIDEO_FRAME_COMP_HEIGHT (out_frame, 0);
+  out_row_wrap = out_stride - out_width;
+
+  /*input & ouput buffer check*/
+  if (in_width != out_width || in_height != out_height || in_fmt != out_fmt) {
+    GST_ERROR_OBJECT (self, "in out frame size not equal");
+    return GST_FLOW_ERROR;
+  }
+
+  if (!self->input_group)
+    gst_iep_alloc_internal_buffer(self);
+
+  frame_in = self->input_buffer[0];
+  frame_out = self->output_buffer[0];
+
+  if (!frame_in || !frame_out) {
+    GST_ERROR_OBJECT (self, "no internal buffer for iep");
+    return GST_FLOW_ERROR;
+  }
+
+  src_phy_addr = mpp_buffer_get_fd(frame_in);
+  src_vir_addr = mpp_buffer_get_ptr(frame_in);
+  dst_phy_addr = mpp_buffer_get_fd(frame_out);
+  dst_vir_addr = mpp_buffer_get_ptr(frame_out);
+
+  memcpy(src_vir_addr, in_data, GST_VIDEO_FRAME_SIZE(in_frame));
+
+  memset(&src, 0, sizeof(iep_img));
+  memset(&dst, 0, sizeof(iep_img));
+ 
+  src.act_w = in_width;
+  src.act_h = in_height;
+  src.x_off = 0;
+  src.y_off = 0;
+  src.vir_w = in_width;
+  src.vir_h = in_height;
+  src.format = IEP_FORMAT_YCrCb_420_SP;
+  src.mem_addr = src_phy_addr;
+  src.uv_addr  = src_phy_addr | (in_width * in_height << 10);
+
+  dst.act_w = in_width;
+  dst.act_h = in_height;
+  dst.x_off = 0;
+  dst.y_off = 0;
+  dst.vir_w = in_width;
+  dst.vir_h = in_height;
+  dst.format = IEP_FORMAT_YCrCb_420_SP;
+  dst.mem_addr = dst_phy_addr;
+  dst.uv_addr = dst_phy_addr | (in_width * in_height << 10);
+
+  iep_ops = alloc_iep_ops();
+  if (!iep_ops)
+    return GST_FLOW_ERROR;
+  iep_obj = iep_ops->claim();
+  if (!iep_obj)
+    return GST_FLOW_ERROR;
+
+  iep_ops->init(iep_obj, &src, &dst);
+ 
+  yuv_dil.high_freq_en = 1;
+  yuv_dil.dil_mode = IEP_DEINTERLACE_MODE_I2O1;
+  yuv_dil.field_order = FIELD_ORDER_BOTTOM_FIRST;
+  yuv_dil.dil_high_freq_fct = 50;
+  yuv_dil.dil_ei_mode = 1;
+  yuv_dil.dil_ei_smooth = 1;
+  yuv_dil.dil_ei_sel = 0;
+  yuv_dil.dil_ei_radius = 2;
+
+  ret = iep_ops->config_yuv_deinterlace_param1(iep_obj, &yuv_dil);
+
+  if (ret < 0) {
+    goto ERR;
+  }
+
+  ret = iep_ops->run_sync(iep_obj);
+  if (ret < 0) {
+    goto ERR;
+  }
+  iep_ops->reclaim(iep_obj);
+  free_iep_ops(iep_ops);
+
+  memcpy(out_data, dst_vir_addr, GST_VIDEO_FRAME_SIZE(out_frame));
+  return;
+
+ERR:
+  GST_ERROR_OBJECT (self, "iep deinterlace failed");
+  iep_ops->reclaim(iep_obj);
+  free_iep_ops(iep_ops);
 }
 
 static GstFlowReturn
 gst_iep_deinterlace_transform_frame (GstVideoFilter * vfilter,
     GstVideoFrame * in_frame, GstVideoFrame * out_frame)
 {
-  GstIepDeinterlace *iep = GST_IEPDEINTERLACE (vfilter);
-
-  /*iep_deinterlace_i402();*/
-  gst_video_frame_copy(out_frame, in_frame);
+  GstIepDeinterlace *self = GST_IEPDEINTERLACE (vfilter);
  
+  if (0)
+    gst_video_frame_copy(out_frame, in_frame);
+  else
+    gst_iep_process(self, in_frame, out_frame);
+
   return GST_FLOW_OK;
+}
+
+static gboolean
+gst_iep_deinterlace_start (GstBaseTransform * trans)
+{
+  return TRUE;
+}
+
+static gboolean
+gst_iep_deinterlace_stop (GstBaseTransform * trans)
+{
+  gint i;
+  GstIepDeinterlace *self = GST_IEPDEINTERLACE (trans);
+
+  /*free mpp buffer*/
+  for (i = 0; i < MPP_MAX_BUFFERS; i++) {
+    if (self->input_buffer[i]) {
+      mpp_buffer_put (self->input_buffer[i]);
+      self->input_buffer[i] = NULL;
+    }
+    if (self->output_buffer[i]) {
+      mpp_buffer_put (self->output_buffer[i]);
+      self->output_buffer[i] = NULL;
+    }
+  }
+
+  /* Must be destroy before input_group */
+  if (self->input_group) {
+    mpp_buffer_group_put (self->input_group);
+    self->input_group = NULL;
+  }
+
+  if (self->output_group) {
+    mpp_buffer_group_put (self->output_group);
+    self->output_group = NULL;
+  }
+
+  GST_DEBUG_OBJECT (self, "Stopped");
+  return TRUE;
 }
 
 /* entry point to initialize the plug-in
